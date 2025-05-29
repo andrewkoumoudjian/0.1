@@ -101,6 +101,7 @@ class SedarCollector:
         """Ensure required directories exist"""
         Path(self.config.download_dir).mkdir(parents=True, exist_ok=True)
         Path(self.config.cache_dir).mkdir(parents=True, exist_ok=True)
+        Path(self.config.cache_dir).parent.joinpath("reference").mkdir(parents=True, exist_ok=True) # Added this line
     
     def _rate_limit(self):
         """Apply rate limiting to be respectful to SEDAR+ servers"""
@@ -190,8 +191,30 @@ class SedarCollector:
         
         # This would typically be an Excel download - you may need to adapt based on actual endpoint
         # For now, we'll create a placeholder method
-        logger.warning("Filing inventory fetch not yet implemented - requires Excel download handling")
-        return pd.DataFrame()
+        logger.info("Fetching filing inventory...")
+
+        FILING_INVENTORY_PATH = Path(self.config.cache_dir).parent / "reference" / "Filing_Inventory.xlsx"
+        
+        logger.info(f"Expecting Filing_Inventory.xlsx at: {FILING_INVENTORY_PATH}")
+
+        if not FILING_INVENTORY_PATH.exists():
+            error_msg = f"Filing_Inventory.xlsx not found at {FILING_INVENTORY_PATH}. Please download the 'Filing Inventory' Excel workbook from the SEDAR+ website and place it at the specified path."
+            logger.error(error_msg)
+            raise FileNotFoundError(error_msg)
+
+        try:
+            df = pd.read_excel(FILING_INVENTORY_PATH)
+            logger.info(f"Successfully parsed {len(df)} document types from Filing_Inventory.xlsx")
+        except Exception as e:
+            logger.error(f"Error parsing Filing_Inventory.xlsx: {e}")
+            raise
+
+        # Cache the processed data
+        cache_file = Path(self.config.cache_dir) / "filing_inventory.csv"
+        df.to_csv(cache_file, index=False)
+        logger.info(f"Cached filing inventory to {cache_file}")
+
+        return df
     
     def download_document(self, url: str, document_guid: str) -> bool:
         """
@@ -321,6 +344,122 @@ class SedarCollector:
         except Exception as e:
             logger.error(f"Failed to insert filings: {e}")
             return False
+
+    def insert_document_types(self, df: pd.DataFrame) -> bool:
+        """
+        Insert or update document type data in the database
+        """
+        if not self.supabase:
+            logger.warning("No Supabase client available, saving document types to local CSV")
+            df.to_csv(Path(self.config.cache_dir) / "document_types_processed.csv", index=False)
+            return True
+
+        try:
+            # Assuming column names from Excel are: 'Filing Category', 'Filing Type', 'Document Type', 'Access Level'
+            # Renaming to match schema: 'filing_category', 'filing_type', 'document_type', 'access_level'
+            df_renamed = df.rename(columns={
+                'Filing Category': 'filing_category',
+                'Filing Type': 'filing_type',
+                'Document Type': 'document_type',
+                'Access Level': 'access_level'
+            })
+
+            rows = []
+            for _, row in df_renamed.iterrows():
+                rows.append({
+                    "filing_category": row["filing_category"],
+                    "filing_type": row["filing_type"],
+                    "document_type": row["document_type"],
+                    "access_level": row["access_level"],
+                    "updated_at": datetime.utcnow().isoformat()
+                })
+            
+            # Upsert based on a composite unique constraint (filing_category, filing_type, document_type)
+            # The constraint name 'document_type_unique_constraint' is assumed to be defined in the DB.
+            # If not, Supabase client might allow specifying columns for conflict resolution.
+            # For now, using the assumed constraint name.
+            # If this causes issues, a fallback could be to use a list of column names for on_conflict
+            # e.g., on_conflict=['filing_category', 'filing_type', 'document_type'] if supported by the client version
+            res = self.supabase.table("dim_document_type").upsert(
+                rows, 
+                on_conflict=['filing_category', 'filing_type', 'document_type']
+            ).execute()
+            
+            if hasattr(res, 'error') and res.error:
+                logger.error(f"Error upserting document types: {res.error}")
+                # Fallback: Try to upsert based on a list of columns if constraint name fails
+                # This part needs to be conditional based on the error, or tested if the client supports it.
+                # For now, we just log the error and return False.
+                # A more robust solution might try a different on_conflict strategy here.
+                return False
+            
+            logger.info(f"Successfully upserted {len(rows)} document types")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to insert document types: {e}")
+            return False
+
+    def update_reference_data(self) -> Dict[str, any]:
+        """
+        Fetches and updates reference data: issuers and document types.
+        """
+        logger.info("Starting reference data update process...")
+        results = {
+            "start_time": datetime.utcnow().isoformat(),
+            "issuers_fetched": 0,
+            "issuers_inserted_successfully": False,
+            "document_types_fetched": 0,
+            "document_types_inserted_successfully": False,
+            "errors": [],
+            "end_time": None
+        }
+
+        # Update issuers
+        try:
+            logger.info("Attempting to fetch and insert issuers...")
+            issuers_df = self.fetch_issuers_csv()
+            results["issuers_fetched"] = len(issuers_df)
+            if results["issuers_fetched"] > 0:
+                if self.insert_issuers(issuers_df):
+                    results["issuers_inserted_successfully"] = True
+                    logger.info("Issuers updated successfully.")
+                else:
+                    results["errors"].append("Failed to insert issuers into database.")
+                    logger.error("Failed to insert issuers into database.")
+            else:
+                logger.info("No issuers fetched or an error occurred during fetch.")
+        except Exception as e:
+            error_msg = f"Error during issuer update: {e}"
+            logger.error(error_msg)
+            results["errors"].append(error_msg)
+
+        # Update document types from Filing Inventory
+        try:
+            logger.info("Attempting to fetch and insert document types from Filing Inventory...")
+            doc_types_df = self.fetch_filing_inventory()
+            results["document_types_fetched"] = len(doc_types_df)
+            if results["document_types_fetched"] > 0:
+                if self.insert_document_types(doc_types_df):
+                    results["document_types_inserted_successfully"] = True
+                    logger.info("Document types updated successfully from Filing Inventory.")
+                else:
+                    results["errors"].append("Failed to insert document types into database.")
+                    logger.error("Failed to insert document types into database.")
+            else:
+                logger.info("No document types fetched from Filing Inventory or an error occurred during fetch.")
+        except FileNotFoundError as fnf_error:
+            error_msg = f"Filing Inventory file not found: {fnf_error}"
+            logger.error(error_msg)
+            results["errors"].append(error_msg)
+        except Exception as e:
+            error_msg = f"Error during document type update: {e}"
+            logger.error(error_msg)
+            results["errors"].append(error_msg)
+
+        results["end_time"] = datetime.utcnow().isoformat()
+        logger.info(f"Reference data update process finished. Results: {results}")
+        return results
     
     def run_incremental_update(self, days_back: int = 7) -> Dict[str, any]:
         """
@@ -446,14 +585,18 @@ def main():
     
     collector = SedarCollector(config)
     
+    # Update reference data
+    ref_data_results = collector.update_reference_data()
+    with open(Path(config.cache_dir) / f"reference_update_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json", "w") as f:
+        json.dump(ref_data_results, f, indent=2)
+    print(f"Reference data update complete. Results: {ref_data_results}")
+
     # Example usage - run incremental update for last 7 days
-    results = collector.run_incremental_update(days_back=7)
-    
-    # Save results
-    with open(Path(config.cache_dir) / f"run_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json", "w") as f:
-        json.dump(results, f, indent=2)
-    
-    print(f"Collection complete. Results: {results}")
+    # Commenting out for now to focus on reference data update, can be re-enabled
+    # incremental_results = collector.run_incremental_update(days_back=7)
+    # with open(Path(config.cache_dir) / f"incremental_run_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json", "w") as f:
+    #     json.dump(incremental_results, f, indent=2)
+    # print(f"Incremental collection complete. Results: {incremental_results}")
 
 if __name__ == "__main__":
     main()

@@ -5,46 +5,51 @@
 -- Following the canonical schema outlined in the technical blueprint
 
 -- Issuers dimension table
+COMMENT ON TABLE public.dim_issuer IS 'Dimension table containing all reporting issuers from SEDAR+. Includes company profile information.';
 CREATE TABLE IF NOT EXISTS public.dim_issuer (
-    issuer_no TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    jurisdiction TEXT,
-    issuer_type TEXT,
-    in_default BOOLEAN DEFAULT FALSE,
-    active_cto BOOLEAN DEFAULT FALSE,
-    first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    issuer_no TEXT PRIMARY KEY, -- Unique identifier for the issuer, sourced from SEDAR+
+    name TEXT NOT NULL, -- Official name of the issuer
+    jurisdiction TEXT, -- Principal jurisdiction of the issuer
+    issuer_type TEXT, -- Type of issuer (e.g., Corporation, Trust)
+    in_default BOOLEAN DEFAULT FALSE, -- Flag indicating if the issuer is in default
+    active_cto BOOLEAN DEFAULT FALSE, -- Flag indicating if there is an active Cease Trade Order against the issuer
+    first_seen TIMESTAMP WITH TIME ZONE DEFAULT NOW(), -- Timestamp of when this issuer was first recorded in our system
+    last_seen TIMESTAMP WITH TIME ZONE DEFAULT NOW(), -- Timestamp of when this issuer was last observed or updated
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() -- Timestamp of the last update to this issuer's record
 );
 
--- Document types dimension
+-- Document types dimension table
+COMMENT ON TABLE public.dim_document_type IS 'Dimension table for classifying document types, categories, and access levels based on the SEDAR+ Filing Inventory.';
 CREATE TABLE IF NOT EXISTS public.dim_document_type (
-    id SERIAL PRIMARY KEY,
-    filing_category TEXT,
-    filing_type TEXT,
-    document_type TEXT,
-    access_level TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    document_type_id SERIAL PRIMARY KEY, -- Surrogate primary key for the document type
+    filing_category TEXT, -- Broad category of the filing (e.g., "Continuous Disclosure", "Prospectus")
+    filing_type TEXT, -- Specific type of filing (e.g., "Annual Financial Statements", "Management Information Circular")
+    document_type TEXT, -- Granular type of the document (e.g., "Interim financial statements", "MD&A")
+    access_level TEXT, -- Access level of the document (e.g., "Public", "Confidential")
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(), -- Timestamp of the last update to this record
+    CONSTRAINT uq_document_type_natural_key UNIQUE (filing_category, filing_type, document_type) -- Natural key constraint
 );
 
 -- Main filings fact table
+COMMENT ON TABLE public.fact_filing IS 'Fact table containing metadata for each filing submitted to SEDAR+. Each record represents a unique document.';
 CREATE TABLE IF NOT EXISTS public.fact_filing (
-    filing_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    issuer_no TEXT REFERENCES public.dim_issuer(issuer_no),
-    document_guid TEXT UNIQUE NOT NULL,
-    filing_type TEXT,
-    document_type TEXT,
-    submitted_date DATE,
-    url TEXT,
-    size_bytes BIGINT,
-    version INTEGER DEFAULT 1,
-    superseded_by UUID REFERENCES public.fact_filing(filing_id),
-    status TEXT DEFAULT 'active',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    filing_id UUID PRIMARY KEY DEFAULT gen_random_uuid(), -- Unique identifier for the filing record (surrogate key)
+    issuer_no TEXT REFERENCES public.dim_issuer(issuer_no), -- Foreign key to the issuer who made the filing
+    document_guid TEXT UNIQUE NOT NULL, -- Globally unique identifier for the document, sourced from SEDAR+
+    filing_type TEXT, -- Type of filing (links conceptually to dim_document_type)
+    document_type TEXT, -- Type of document (links conceptually to dim_document_type)
+    submitted_date DATE, -- Date the filing was submitted to SEDAR+
+    url TEXT, -- URL to download the actual document from SEDAR+
+    size_bytes BIGINT, -- Size of the document in bytes
+    version INTEGER DEFAULT 1, -- Version number of the document, if applicable
+    superseded_by UUID REFERENCES public.fact_filing(filing_id), -- If this document version is superseded, points to the new version's filing_id
+    status TEXT DEFAULT 'active', -- Status of the filing (e.g., active, amended, superseded)
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(), -- Timestamp of when this filing record was created in our system
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() -- Timestamp of the last update to this filing record
 );
 
 -- Financial statement line items (for future use)
+COMMENT ON TABLE public.fact_statement_line IS 'Stores extracted line items from financial statements (e.g., Revenue, Net Income). For future analytical use.';
 CREATE TABLE IF NOT EXISTS public.fact_statement_line (
     id SERIAL PRIMARY KEY,
     filing_id UUID REFERENCES public.fact_filing(filing_id),
@@ -53,10 +58,11 @@ CREATE TABLE IF NOT EXISTS public.fact_statement_line (
     line_item TEXT,
     value DECIMAL(20,2),
     currency TEXT DEFAULT 'CAD',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
 -- Insider trading data (from SEDI integration)
+COMMENT ON TABLE public.fact_insider_tx IS 'Stores insider trading transactions, potentially integrated from SEDI data.';
 CREATE TABLE IF NOT EXISTS public.fact_insider_tx (
     id SERIAL PRIMARY KEY,
     issuer_no TEXT REFERENCES public.dim_issuer(issuer_no),
@@ -68,10 +74,11 @@ CREATE TABLE IF NOT EXISTS public.fact_insider_tx (
     volume BIGINT,
     price DECIMAL(10,4),
     total_value DECIMAL(20,2),
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
 -- Sentiment analysis results
+COMMENT ON TABLE public.mart_sentiment IS 'Stores results of NLP sentiment analysis performed on filing documents.';
 CREATE TABLE IF NOT EXISTS public.mart_sentiment (
     id SERIAL PRIMARY KEY,
     filing_id UUID REFERENCES public.fact_filing(filing_id),
@@ -81,21 +88,23 @@ CREATE TABLE IF NOT EXISTS public.mart_sentiment (
     uncertainty DECIMAL(5,4),
     key_topics JSONB,
     model_version TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
 -- Financial ratios and metrics
+COMMENT ON TABLE public.mart_financial_ratios IS 'Stores calculated financial ratios and metrics for issuers.';
 CREATE TABLE IF NOT EXISTS public.mart_financial_ratios (
     id SERIAL PRIMARY KEY,
     issuer_no TEXT REFERENCES public.dim_issuer(issuer_no),
     fiscal_period TEXT,
     ratio_name TEXT,
     ratio_value DECIMAL(10,4),
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     UNIQUE(issuer_no, fiscal_period, ratio_name)
 );
 
 -- User alerts and watchlists (for future web platform)
+COMMENT ON TABLE public.user_alerts IS 'Supports user-defined alerts and watchlists for a potential web application.';
 CREATE TABLE IF NOT EXISTS public.user_alerts (
     id SERIAL PRIMARY KEY,
     user_id UUID, -- Will reference user management system
@@ -103,20 +112,21 @@ CREATE TABLE IF NOT EXISTS public.user_alerts (
     issuer_no TEXT REFERENCES public.dim_issuer(issuer_no),
     conditions JSONB,
     is_active BOOLEAN DEFAULT TRUE,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
 -- Collection job tracking
+COMMENT ON TABLE public.collection_jobs IS 'Tracks the execution, status, and metadata of data collection jobs.';
 CREATE TABLE IF NOT EXISTS public.collection_jobs (
     id SERIAL PRIMARY KEY,
     job_type TEXT, -- 'incremental', 'backfill', 'manual'
-    start_time TIMESTAMP,
-    end_time TIMESTAMP,
+    start_time TIMESTAMP WITH TIME ZONE,
+    end_time TIMESTAMP WITH TIME ZONE,
     status TEXT, -- 'running', 'completed', 'failed'
     records_processed INTEGER DEFAULT 0,
     errors JSONB,
     metadata JSONB,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
 -- Indexes for performance
@@ -132,13 +142,7 @@ CREATE INDEX IF NOT EXISTS idx_mart_sentiment_filing_id ON public.mart_sentiment
 -- ALTER TABLE public.fact_filing ENABLE ROW LEVEL SECURITY;
 -- CREATE POLICY "Users can only see their accessible data" ON public.fact_filing FOR SELECT USING (true); -- Modify based on your access requirements
 
--- Comments for documentation
-COMMENT ON TABLE public.dim_issuer IS 'Dimension table containing all reporting issuers from SEDAR+';
-COMMENT ON TABLE public.fact_filing IS 'Fact table containing all filings metadata from SEDAR+';
-COMMENT ON TABLE public.fact_statement_line IS 'Financial statement line items extracted from filings';
-COMMENT ON TABLE public.fact_insider_tx IS 'Insider trading transactions from SEDI';
-COMMENT ON TABLE public.mart_sentiment IS 'NLP sentiment analysis results for filings';
-COMMENT ON TABLE public.mart_financial_ratios IS 'Calculated financial ratios and metrics';
+-- Comments for documentation (table-level comments are now above each table)
 
 -- Example queries for testing the schema:
 /*
