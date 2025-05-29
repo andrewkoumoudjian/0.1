@@ -1,0 +1,10 @@
+{
+  "start_time": "2025-05-29T22:27:56.695316",
+  "issuers_updated": false,
+  "filings_processed": 0,
+  "documents_downloaded": 0,
+  "errors": [
+    "Incremental update failed: 404 Client Error: Not Found for url: https://www.sedarplus.ca/csa-party/service/exportCsv"
+  ],
+  "end_time": "2025-05-29T22:27:57.954397"
+}

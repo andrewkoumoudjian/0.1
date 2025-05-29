@@ -1,0 +1,5 @@
+2025-05-29 18:27:56,695 - __main__ - INFO - Starting incremental update for last 7 days
+2025-05-29 18:27:56,695 - __main__ - INFO - Fetching reporting issuers list...
+2025-05-29 18:27:57,953 - __main__ - ERROR - Request failed: 404 Client Error: Not Found for url: https://www.sedarplus.ca/csa-party/service/exportCsv
+2025-05-29 18:27:57,954 - __main__ - ERROR - Failed to fetch issuers: 404 Client Error: Not Found for url: https://www.sedarplus.ca/csa-party/service/exportCsv
+2025-05-29 18:27:57,954 - __main__ - ERROR - Incremental update failed: 404 Client Error: Not Found for url: https://www.sedarplus.ca/csa-party/service/exportCsv
