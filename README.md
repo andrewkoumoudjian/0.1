@@ -97,27 +97,32 @@ The historical backfill (`run_historical_backfill`) continues to use the CSV exp
         *   Default: `./data/cache`
         *   Purpose: Stores intermediate data to speed up subsequent runs and reduce API calls.
 
-4.  **Manual Setup - Filing Inventory**:
-    The script requires the "Filing Inventory" Excel file from SEDAR+ to correctly map and categorize document types. This file must be downloaded manually.
+4.  **Important Prerequisite: Filing Inventory File**
 
-    *   **What it is**: The Filing Inventory provides a comprehensive list of filing categories, filing types, and document types used on SEDAR+.
-    *   **Why it's needed**: `sedar_collector.py` uses this file to populate the `dim_document_type` table in the database (if configured) and to understand the structure of available documents.
-    *   **How to get it**:
-        1.  Go to the SEDAR+ website ([https://www.sedarplus.ca/](https://www.sedarplus.ca/)).
-        2.  Look for a section typically named "SEDAR+ User Resources," "Help," "Tools," or "Reference Materials." The "Filing Inventory" Excel workbook is usually found there. (The exact location may change, so you might need to browse the site).
-        3.  Download the Excel file. It is often named `Filing_Inventory.xlsx` or similar.
-    *   **Where to place it**:
-        1.  Rename the downloaded file to `Filing_Inventory.xlsx`.
-        2.  Place this file in the `data/reference/` directory at the root of the project.
+    The `Filing_Inventory.xlsx` file is **crucial** for the script to correctly classify and store information about different document types (e.g., into the `dim_document_type` table). This file **must be manually downloaded** by the user from the official SEDAR+ website.
+
+    *   **What it is**: An Excel workbook provided by SEDAR+ that lists all official filing categories, filing types, and document types.
+    *   **Why it's essential**: The `sedar_collector.py` script relies on this file to:
+        *   Populate the `dim_document_type` table in your database, which allows for structured querying and analysis of filings by their specific types.
+        *   Understand the hierarchy and codes for different document classifications used by SEDAR+.
+    *   **How to Obtain It**:
+        1.  Navigate to the SEDAR+ website: [https://www.sedarplus.ca/](https://www.sedarplus.ca/)
+        2.  Look for sections such as "SEDAR+ User Resources," "Help," "Tools & Resources," "Guides & Information," or similar. The file is often located where resources for filers or information about filing taxonomies are provided.
+        3.  Download the Excel file. It is typically named `Filing_Inventory.xlsx` or a similar variant.
+    *   **Required Location and Name**:
+        1.  Once downloaded, rename the file **exactly** to `Filing_Inventory.xlsx`.
+        2.  Place this file in the following directory within the project:
             ```
             YourProjectRoot/
-            ├── data/
-            │   └── reference/
-            │       └── Filing_Inventory.xlsx
-            ├── sedar_collector.py
-            └── ... other files
+            └── data/
+                └── reference/
+                    └── Filing_Inventory.xlsx 
             ```
-        3.  The script will attempt to create the `data/reference/` directory if it doesn't exist when `update_reference_data()` is run. However, it's good practice to ensure it's there.
+        3.  The script will automatically look for it at `data/reference/Filing_Inventory.xlsx`. If the `data/reference/` directories do not exist, the script will attempt to create them during the `update_reference_data` process, but it's best to ensure they are present.
+    *   **Impact if Missing**:
+        *   If the `Filing_Inventory.xlsx` file is not found at the specified path when the `update_reference_data` function runs, the script **will not be able to update document type classifications** in the database.
+        *   A warning message will be logged indicating that the file is missing and that the document type update step is being skipped.
+        *   Other data collection tasks, such as fetching the list of issuers or collecting recent filings (via `run_incremental_update`), will still attempt to run. However, the completeness of your reference data (specifically `dim_document_type`) will be affected.
 
 ## Running the Script
 

@@ -21,7 +21,7 @@ import logging
 import json
 import hashlib
 from typing import List, Dict, Optional, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from pathlib import Path
 import requests
@@ -137,8 +137,10 @@ class SedarCollector:
         
         try:
             response = self._make_request("POST", url, json=payload)
-            df = pd.read_csv(pd.io.common.StringIO(response.text))
-            logger.info(f"Successfully fetched {len(df)} issuers")
+            # Added on_bad_lines='warn' to handle potential parsing issues without crashing.
+            # Pandas will output warnings to stderr for bad lines, which should be captured by the logging setup.
+            df = pd.read_csv(pd.io.common.StringIO(response.text), on_bad_lines='warn')
+            logger.info(f"Successfully fetched {len(df)} issuers. Check logs for any parsing warnings (on_bad_lines='warn' was used).")
             
             # Cache the result
             cache_file = Path(self.config.cache_dir) / f"issuers_{datetime.now().strftime('%Y%m%d')}.csv"
@@ -198,7 +200,13 @@ class SedarCollector:
         logger.info(f"Expecting Filing_Inventory.xlsx at: {FILING_INVENTORY_PATH}")
 
         if not FILING_INVENTORY_PATH.exists():
-            error_msg = f"Filing_Inventory.xlsx not found at {FILING_INVENTORY_PATH}. Please download the 'Filing Inventory' Excel workbook from the SEDAR+ website and place it at the specified path."
+            error_msg = (
+                f"MANUAL PREREQUISITE MISSING: Filing_Inventory.xlsx not found at {FILING_INVENTORY_PATH}. "
+                "This file is essential for mapping document types and categories. "
+                "Please download the 'Filing Inventory' Excel workbook directly from the SEDAR+ website "
+                "(usually found under 'User Resources' or 'Help' sections) and place it in the "
+                f"'{FILING_INVENTORY_PATH.parent}' directory, ensuring it is named 'Filing_Inventory.xlsx'."
+            )
             logger.error(error_msg)
             raise FileNotFoundError(error_msg)
 
@@ -289,7 +297,7 @@ class SedarCollector:
                     "issuer_type": row["Type"],
                     "in_default": bool(row["In Default Flag"]),
                     "active_cto": bool(row["Active CTO Flag"]),
-                    "updated_at": datetime.utcnow().isoformat()
+                    "updated_at": datetime.now(timezone.utc).isoformat()
                 })
             
             # Batch insert with upsert
@@ -328,7 +336,7 @@ class SedarCollector:
                     "url": row["Generate URL"],
                     "size_bytes": row.get("Size", None),
                     "version": row.get("Version", 1),
-                    "created_at": datetime.utcnow().isoformat()
+                    "created_at": datetime.now(timezone.utc).isoformat()
                 })
             
             # Batch insert with upsert
@@ -371,7 +379,7 @@ class SedarCollector:
                     "filing_type": row["filing_type"],
                     "document_type": row["document_type"],
                     "access_level": row["access_level"],
-                    "updated_at": datetime.utcnow().isoformat()
+                    "updated_at": datetime.now(timezone.utc).isoformat()
                 })
             
             # Upsert based on a composite unique constraint (filing_category, filing_type, document_type)
@@ -417,17 +425,17 @@ class SedarCollector:
                 "sortOrder": "desc"
             }
         }
-        self.logger.info(f"Fetching recent filings JSON from {start_date} to {end_date}")
+        logger.info(f"Fetching recent filings JSON from {start_date} to {end_date}")
 
         try:
             response = self._make_request("POST", url, json=payload)
             response_data = response.json()
         except Exception as e:
-            self.logger.error(f"Error fetching or parsing filings JSON: {e}")
+            logger.error(f"Error fetching or parsing filings JSON: {e}")
             return []
 
         if not response_data or "results" not in response_data:
-            self.logger.error("Failed to fetch filings or no results found in JSON response.")
+            logger.error("Failed to fetch filings or no results found in JSON response.")
             return []
 
         filings = []
@@ -439,7 +447,7 @@ class SedarCollector:
                     pdf_url = f"{self.config.base_url}/csa-party/records/document.html?id={item['documentGuid']}"
                 else:
                     pdf_url = None # Or some other placeholder if documentGuid is missing
-                    self.logger.warning(f"Missing documentGuid for an item, cannot generate fallback URL. Item: {item}")
+                    logger.warning(f"Missing documentGuid for an item, cannot generate fallback URL. Item: {item}")
 
 
             filings.append({
@@ -452,14 +460,14 @@ class SedarCollector:
                 "pdf_url": pdf_url
             })
         
-        self.logger.info(f"Retrieved {len(filings)} filings via JSON endpoint.")
+        logger.info(f"Retrieved {len(filings)} filings via JSON endpoint.")
         return filings
 
     def download_pdf_to_bytes(self, pdf_url: str) -> Optional[bytes]:
         """
         Downloads a PDF from the given URL and returns its content as bytes.
         """
-        self.logger.info(f"Attempting to download PDF from URL: {pdf_url}")
+        logger.info(f"Attempting to download PDF from URL: {pdf_url}")
         try:
             # _make_request handles rate limiting, retries, and basic error logging.
             # stream=True is important for efficient handling of potentially large files.
@@ -469,18 +477,18 @@ class SedarCollector:
             # the request was successful in terms of HTTP status codes.
             
             pdf_bytes = response.content
-            self.logger.info(f"Successfully downloaded {len(pdf_bytes)} bytes from {pdf_url}")
+            logger.info(f"Successfully downloaded {len(pdf_bytes)} bytes from {pdf_url}")
             return pdf_bytes
         except requests.exceptions.RequestException as e:
             # _make_request already logs the error, but we can add context here.
-            self.logger.error(f"Failed to download PDF from {pdf_url}: {e}")
+            logger.error(f"Failed to download PDF from {pdf_url}: {e}")
             # Let the exception propagate to be handled by the caller,
             # or return None if specific handling is preferred here.
             # For now, re-raising to ensure caller is aware.
             raise
         except Exception as e:
             # Catch any other unexpected errors
-            self.logger.error(f"An unexpected error occurred while downloading PDF from {pdf_url}: {e}")
+            logger.error(f"An unexpected error occurred while downloading PDF from {pdf_url}: {e}")
             raise
 
     def insert_filing_with_pdf(self, filing_data: Dict[str, Any], pdf_bytes: bytes) -> bool:
@@ -488,12 +496,12 @@ class SedarCollector:
         Inserts a filing record along with its PDF data into the Supabase 'filings' table.
         """
         if not self.supabase:
-            self.logger.warning("Supabase client not available. Skipping database insertion of filing with PDF.")
+            logger.warning("Supabase client not available. Skipping database insertion of filing with PDF.")
             return False
 
         document_guid = filing_data.get("document_guid")
         if not document_guid:
-            self.logger.error("Cannot insert filing: document_guid is missing from filing_data.")
+            logger.error("Cannot insert filing: document_guid is missing from filing_data.")
             return False
 
         try:
@@ -504,7 +512,7 @@ class SedarCollector:
             if date_filed_raw:
                 date_filed = date_filed_raw.split('T')[0]
             else:
-                self.logger.warning(f"date_filed is missing for document_guid: {document_guid}. Setting to None.")
+                logger.warning(f"date_filed is missing for document_guid: {document_guid}. Setting to None.")
                 date_filed = None
 
 
@@ -518,26 +526,26 @@ class SedarCollector:
                 "pdf_data": pdf_bytes  # Supabase client handles bytes for BYTEA columns
             }
 
-            self.logger.info(f"Attempting to upsert filing {document_guid} with PDF data.")
+            logger.info(f"Attempting to upsert filing {document_guid} with PDF data.")
             
             # Upsert into the 'filings' table
             res = self.supabase.table("filings").upsert(row_data, on_conflict="document_guid").execute()
 
             # Check for errors (compatibility with different supabase-py versions)
             if hasattr(res, 'error') and res.error:
-                self.logger.error(f"Error upserting filing {document_guid}: {res.error}")
+                logger.error(f"Error upserting filing {document_guid}: {res.error}")
                 return False
             # For newer versions, data might be empty or contain an error indication if not successful
             if not res.data and not (hasattr(res, 'status_code') and 200 <= res.status_code < 300): # Check status_code for v2
-                 self.logger.error(f"Failed to upsert filing {document_guid}. Response: {res}")
+                 logger.error(f"Failed to upsert filing {document_guid}. Response: {res}")
                  return False
 
 
-            self.logger.info(f"Successfully upserted filing {document_guid} with PDF data.")
+            logger.info(f"Successfully upserted filing {document_guid} with PDF data.")
             return True
 
         except Exception as e:
-            self.logger.error(f"An exception occurred while inserting filing {document_guid} with PDF: {e}")
+            logger.error(f"An exception occurred while inserting filing {document_guid} with PDF: {e}")
             return False
 
     def update_reference_data(self) -> Dict[str, any]:
@@ -546,7 +554,7 @@ class SedarCollector:
         """
         logger.info("Starting reference data update process...")
         results = {
-            "start_time": datetime.utcnow().isoformat(),
+            "start_time": datetime.now(timezone.utc).isoformat(),
             "issuers_fetched": 0,
             "issuers_inserted_successfully": False,
             "document_types_fetched": 0,
@@ -576,28 +584,45 @@ class SedarCollector:
 
         # Update document types from Filing Inventory
         try:
-            logger.info("Attempting to fetch and insert document types from Filing Inventory...")
-            doc_types_df = self.fetch_filing_inventory()
+            logger.info("Attempting to fetch and process Filing Inventory for document types...")
+            doc_types_df = self.fetch_filing_inventory() # This will raise FileNotFoundError if not present
+            
             results["document_types_fetched"] = len(doc_types_df)
             if results["document_types_fetched"] > 0:
+                logger.info(f"Successfully loaded {len(doc_types_df)} entries from Filing_Inventory.xlsx.")
                 if self.insert_document_types(doc_types_df):
                     results["document_types_inserted_successfully"] = True
-                    logger.info("Document types updated successfully from Filing Inventory.")
+                    logger.info("Document types successfully updated in the database.")
                 else:
-                    results["errors"].append("Failed to insert document types into database.")
-                    logger.error("Failed to insert document types into database.")
+                    # Error already logged by insert_document_types if it returns False
+                    results["errors"].append("Failed to insert document types into database (see previous logs).")
+                    logger.error("Failed to insert document types into database.") # Redundant but explicit
             else:
-                logger.info("No document types fetched from Filing Inventory or an error occurred during fetch.")
-        except FileNotFoundError as fnf_error:
-            error_msg = f"Filing Inventory file not found: {fnf_error}"
-            logger.error(error_msg)
-            results["errors"].append(error_msg)
+                logger.info("No document types found or loaded from Filing Inventory.")
+                # results["document_types_inserted_successfully"] remains False
+        
+        except FileNotFoundError as e:
+            # This error is now more descriptive from fetch_filing_inventory
+            warning_msg = (
+                f"Could not update document types: {e}. "
+                "Please ensure 'Filing_Inventory.xlsx' is manually downloaded from SEDAR+ and placed in "
+                f"'{Path(self.config.cache_dir).parent / 'reference' / 'Filing_Inventory.xlsx'}'. "
+                "Skipping document type update for this run."
+            )
+            logger.warning(warning_msg)
+            results["errors"].append(str(e)) # The detailed error from fetch_filing_inventory
+            # results["document_types_fetched"] remains 0
+            # results["document_types_inserted_successfully"] remains False
+        
         except Exception as e:
-            error_msg = f"Error during document type update: {e}"
+            # Catch any other unexpected errors during document type processing
+            error_msg = f"An unexpected error occurred during document type update: {e}"
             logger.error(error_msg)
             results["errors"].append(error_msg)
+            # results["document_types_fetched"] might be set or not, ensure inserted_successfully is False
+            results["document_types_inserted_successfully"] = False
 
-        results["end_time"] = datetime.utcnow().isoformat()
+        results["end_time"] = datetime.now(timezone.utc).isoformat()
         logger.info(f"Reference data update process finished. Results: {results}")
         return results
     
@@ -608,7 +633,7 @@ class SedarCollector:
         logger.info(f"Starting incremental update for the last {days_back} day(s) using JSON/PDF byte workflow.")
         
         results = {
-            "start_time": datetime.utcnow().isoformat(),
+            "start_time": datetime.now(timezone.utc).isoformat(),
             "issuers_updated": False,
             "total_filings_retrieved_json": 0,
             "total_pdfs_downloaded_to_memory": 0,
@@ -635,7 +660,7 @@ class SedarCollector:
 
             # Process filings for each day in the specified range
             for days_ago in range(days_back):
-                target_date = datetime.utcnow() - timedelta(days=days_ago)
+                target_date = datetime.now(timezone.utc) - timedelta(days=days_ago)
                 target_date_str = target_date.strftime("%Y-%m-%d")
                 logger.info(f"--- Starting processing for date: {target_date_str} ---") # Enhanced log statement
 
@@ -687,7 +712,7 @@ class SedarCollector:
                     logger.error(error_msg)
                     results["errors"].append(error_msg)
             
-            results["end_time"] = datetime.utcnow().isoformat()
+            results["end_time"] = datetime.now(timezone.utc).isoformat()
             logger.info(f"Incremental update complete. Results: {results}")
             return results
             
@@ -695,7 +720,7 @@ class SedarCollector:
             error_msg = f"Critical error in incremental update process: {e}"
             logger.error(error_msg)
             results["errors"].append(error_msg)
-            results["end_time"] = datetime.utcnow().isoformat()
+            results["end_time"] = datetime.now(timezone.utc).isoformat()
             return results
     
     def run_historical_backfill(self, start_date: str, end_date: str, chunk_days: int = 30) -> Dict[str, any]:
@@ -705,7 +730,7 @@ class SedarCollector:
         logger.info(f"Starting historical backfill from {start_date} to {end_date}")
         
         results = {
-            "start_time": datetime.utcnow().isoformat(),
+            "start_time": datetime.now(timezone.utc).isoformat(),
             "total_filings": 0,
             "total_downloads": 0,
             "chunks_processed": 0,
@@ -744,7 +769,7 @@ class SedarCollector:
                 
                 current_dt = chunk_end + timedelta(days=1)
             
-            results["end_time"] = datetime.utcnow().isoformat()
+            results["end_time"] = datetime.now(timezone.utc).isoformat()
             logger.info(f"Historical backfill complete: {results}")
             
             return results
@@ -753,7 +778,7 @@ class SedarCollector:
             error_msg = f"Historical backfill failed: {e}"
             logger.error(error_msg)
             results["errors"].append(error_msg)
-            results["end_time"] = datetime.utcnow().isoformat()
+            results["end_time"] = datetime.now(timezone.utc).isoformat()
             return results
 
 def main():
