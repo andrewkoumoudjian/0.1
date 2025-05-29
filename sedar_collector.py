@@ -400,6 +400,146 @@ class SedarCollector:
             logger.error(f"Failed to insert document types: {e}")
             return False
 
+    def fetch_recent_filings_json(self, start_date: str, end_date: str) -> List[Dict[str, Any]]:
+        """
+        Fetches recent filings within a given date range and returns them as a list of dictionaries.
+        """
+        url = f"{self.config.base_url}/csa-party/service/searchDocuments"
+        payload = {
+            "service": "searchDocuments",
+            "queryArgs": {
+                "_locale": "en",
+                "fromDate": start_date,
+                "toDate": end_date,
+                "page": 1,
+                "pageSize": 1000, # Consider making pageSize configurable
+                "sortColumn": "dateFiled",
+                "sortOrder": "desc"
+            }
+        }
+        self.logger.info(f"Fetching recent filings JSON from {start_date} to {end_date}")
+
+        try:
+            response = self._make_request("POST", url, json=payload)
+            response_data = response.json()
+        except Exception as e:
+            self.logger.error(f"Error fetching or parsing filings JSON: {e}")
+            return []
+
+        if not response_data or "results" not in response_data:
+            self.logger.error("Failed to fetch filings or no results found in JSON response.")
+            return []
+
+        filings = []
+        for item in response_data["results"]:
+            pdf_url = item.get("generateUrl")
+            if not pdf_url:
+                # Ensure documentGuid is present before constructing fallback URL
+                if item.get("documentGuid"):
+                    pdf_url = f"{self.config.base_url}/csa-party/records/document.html?id={item['documentGuid']}"
+                else:
+                    pdf_url = None # Or some other placeholder if documentGuid is missing
+                    self.logger.warning(f"Missing documentGuid for an item, cannot generate fallback URL. Item: {item}")
+
+
+            filings.append({
+                "issuer_no": item.get("issuerNumber"),
+                "document_guid": item.get("documentGuid"),
+                "date_filed": item.get("dateFiled"), # Keep as string
+                "filing_type": item.get("filingType"),
+                "document_type": item.get("documentType"),
+                "size_bytes": item.get("sizeInBytes"),
+                "pdf_url": pdf_url
+            })
+        
+        self.logger.info(f"Retrieved {len(filings)} filings via JSON endpoint.")
+        return filings
+
+    def download_pdf_to_bytes(self, pdf_url: str) -> Optional[bytes]:
+        """
+        Downloads a PDF from the given URL and returns its content as bytes.
+        """
+        self.logger.info(f"Attempting to download PDF from URL: {pdf_url}")
+        try:
+            # _make_request handles rate limiting, retries, and basic error logging.
+            # stream=True is important for efficient handling of potentially large files.
+            response = self._make_request("GET", pdf_url, stream=True, timeout=60)
+            
+            # _make_request raises an exception on HTTP error status, so if we get here,
+            # the request was successful in terms of HTTP status codes.
+            
+            pdf_bytes = response.content
+            self.logger.info(f"Successfully downloaded {len(pdf_bytes)} bytes from {pdf_url}")
+            return pdf_bytes
+        except requests.exceptions.RequestException as e:
+            # _make_request already logs the error, but we can add context here.
+            self.logger.error(f"Failed to download PDF from {pdf_url}: {e}")
+            # Let the exception propagate to be handled by the caller,
+            # or return None if specific handling is preferred here.
+            # For now, re-raising to ensure caller is aware.
+            raise
+        except Exception as e:
+            # Catch any other unexpected errors
+            self.logger.error(f"An unexpected error occurred while downloading PDF from {pdf_url}: {e}")
+            raise
+
+    def insert_filing_with_pdf(self, filing_data: Dict[str, Any], pdf_bytes: bytes) -> bool:
+        """
+        Inserts a filing record along with its PDF data into the Supabase 'filings' table.
+        """
+        if not self.supabase:
+            self.logger.warning("Supabase client not available. Skipping database insertion of filing with PDF.")
+            return False
+
+        document_guid = filing_data.get("document_guid")
+        if not document_guid:
+            self.logger.error("Cannot insert filing: document_guid is missing from filing_data.")
+            return False
+
+        try:
+            # Ensure date_filed is in 'YYYY-MM-DD' format.
+            # The date from SEDAR+ is usually "YYYY-MM-DDTHH:MM:SSZ" or "YYYY-MM-DD".
+            # We only need the date part.
+            date_filed_raw = filing_data.get("date_filed")
+            if date_filed_raw:
+                date_filed = date_filed_raw.split('T')[0]
+            else:
+                self.logger.warning(f"date_filed is missing for document_guid: {document_guid}. Setting to None.")
+                date_filed = None
+
+
+            row_data = {
+                "issuer_no": filing_data.get("issuer_no"),
+                "document_guid": document_guid,
+                "date_filed": date_filed,
+                "filing_type": filing_data.get("filing_type"),
+                "document_type": filing_data.get("document_type"),
+                "size_bytes": filing_data.get("size_bytes"),
+                "pdf_data": pdf_bytes  # Supabase client handles bytes for BYTEA columns
+            }
+
+            self.logger.info(f"Attempting to upsert filing {document_guid} with PDF data.")
+            
+            # Upsert into the 'filings' table
+            res = self.supabase.table("filings").upsert(row_data, on_conflict="document_guid").execute()
+
+            # Check for errors (compatibility with different supabase-py versions)
+            if hasattr(res, 'error') and res.error:
+                self.logger.error(f"Error upserting filing {document_guid}: {res.error}")
+                return False
+            # For newer versions, data might be empty or contain an error indication if not successful
+            if not res.data and not (hasattr(res, 'status_code') and 200 <= res.status_code < 300): # Check status_code for v2
+                 self.logger.error(f"Failed to upsert filing {document_guid}. Response: {res}")
+                 return False
+
+
+            self.logger.info(f"Successfully upserted filing {document_guid} with PDF data.")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"An exception occurred while inserting filing {document_guid} with PDF: {e}")
+            return False
+
     def update_reference_data(self) -> Dict[str, any]:
         """
         Fetches and updates reference data: issuers and document types.
@@ -461,53 +601,98 @@ class SedarCollector:
         logger.info(f"Reference data update process finished. Results: {results}")
         return results
     
-    def run_incremental_update(self, days_back: int = 7) -> Dict[str, any]:
+    def run_incremental_update(self, days_back: int = 1) -> Dict[str, any]: # Default to 1 day as per typical incremental use
         """
-        Run an incremental update for the last N days
+        Run an incremental update for the last N days using JSON fetching and PDF byte storage.
         """
-        logger.info(f"Starting incremental update for last {days_back} days")
+        logger.info(f"Starting incremental update for the last {days_back} day(s) using JSON/PDF byte workflow.")
         
         results = {
             "start_time": datetime.utcnow().isoformat(),
             "issuers_updated": False,
-            "filings_processed": 0,
-            "documents_downloaded": 0,
+            "total_filings_retrieved_json": 0,
+            "total_pdfs_downloaded_to_memory": 0,
+            "total_filings_inserted_with_pdf": 0,
             "errors": []
         }
         
         try:
-            # Update issuers (less frequent, but good to refresh)
-            issuers_df = self.fetch_issuers_csv()
-            results["issuers_updated"] = self.insert_issuers(issuers_df)
-            
-            # Process filings for each day
+            # Update issuers (can remain, good practice)
+            try:
+                logger.info("Attempting to refresh issuer data...")
+                issuers_df = self.fetch_issuers_csv()
+                if issuers_df is not None and not issuers_df.empty:
+                    results["issuers_updated"] = self.insert_issuers(issuers_df)
+                    logger.info(f"Issuer data refresh status: {results['issuers_updated']}")
+                else:
+                    logger.warning("No issuer data fetched, skipping issuer update.")
+                    results["issuers_updated"] = False
+            except Exception as e:
+                error_msg = f"Error during issuer data refresh: {e}"
+                logger.error(error_msg)
+                results["errors"].append(error_msg)
+                results["issuers_updated"] = False
+
+            # Process filings for each day in the specified range
             for days_ago in range(days_back):
-                date = (datetime.utcnow() - timedelta(days=days_ago)).strftime("%Y-%m-%d")
-                
+                target_date = datetime.utcnow() - timedelta(days=days_ago)
+                target_date_str = target_date.strftime("%Y-%m-%d")
+                logger.info(f"--- Starting processing for date: {target_date_str} ---") # Enhanced log statement
+
                 try:
-                    filings_df = self.fetch_filings_for_date_range(date, date)
-                    
-                    if len(filings_df) > 0:
-                        # Insert filing metadata
-                        if self.insert_filings(filings_df):
-                            results["filings_processed"] += len(filings_df)
+                    # 1. Fetch recent filings metadata using the JSON endpoint
+                    filings_metadata = self.fetch_recent_filings_json(start_date=target_date_str, end_date=target_date_str)
+                    results["total_filings_retrieved_json"] += len(filings_metadata)
+                    logger.info(f"Retrieved {len(filings_metadata)} filing metadata entries for {target_date_str}.")
+
+                    if not filings_metadata:
+                        logger.info(f"No filings found for {target_date_str}.")
+                        continue
+
+                    for filing_data in filings_metadata:
+                        document_guid = filing_data.get("document_guid")
+                        pdf_url = filing_data.get("pdf_url")
+
+                        if not document_guid or not pdf_url:
+                            logger.warning(f"Skipping filing due to missing document_guid or pdf_url: {filing_data}")
+                            results["errors"].append(f"Skipped filing (missing guid/url): {filing_data.get('issuer_no', 'N/A')}-{document_guid}")
+                            continue
                         
-                        # Download documents
-                        download_results = self.download_documents_batch(filings_df)
-                        results["documents_downloaded"] += sum(download_results.values())
-                    
+                        logger.info(f"Processing filing: {document_guid} from URL: {pdf_url}")
+
+                        try:
+                            # 2. Download PDF to bytes
+                            pdf_bytes = self.download_pdf_to_bytes(pdf_url=pdf_url)
+
+                            if pdf_bytes:
+                                results["total_pdfs_downloaded_to_memory"] += 1
+                                # 3. Insert filing metadata and PDF bytes into database
+                                if self.insert_filing_with_pdf(filing_data=filing_data, pdf_bytes=pdf_bytes):
+                                    results["total_filings_inserted_with_pdf"] += 1
+                                else:
+                                    logger.error(f"Failed to insert filing {document_guid} with PDF into database.")
+                                    results["errors"].append(f"DB Insert Failed: {document_guid}")
+                            else:
+                                logger.warning(f"Failed to download PDF for {document_guid} from {pdf_url}. Skipping database insertion.")
+                                results["errors"].append(f"PDF Download Failed: {document_guid}")
+
+                        except Exception as e:
+                            error_msg = f"Error processing filing {document_guid} (URL: {pdf_url}): {e}"
+                            logger.error(error_msg)
+                            results["errors"].append(error_msg)
+                            # Continue to the next filing
+
                 except Exception as e:
-                    error_msg = f"Failed to process date {date}: {e}"
+                    error_msg = f"Failed to process filings for date {target_date_str}: {e}"
                     logger.error(error_msg)
                     results["errors"].append(error_msg)
             
             results["end_time"] = datetime.utcnow().isoformat()
-            logger.info(f"Incremental update complete: {results}")
-            
+            logger.info(f"Incremental update complete. Results: {results}")
             return results
             
-        except Exception as e:
-            error_msg = f"Incremental update failed: {e}"
+        except Exception as e: # Catch-all for the entire method
+            error_msg = f"Critical error in incremental update process: {e}"
             logger.error(error_msg)
             results["errors"].append(error_msg)
             results["end_time"] = datetime.utcnow().isoformat()
@@ -584,19 +769,43 @@ def main():
     )
     
     collector = SedarCollector(config)
-    
-    # Update reference data
-    ref_data_results = collector.update_reference_data()
-    with open(Path(config.cache_dir) / f"reference_update_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json", "w") as f:
-        json.dump(ref_data_results, f, indent=2)
-    print(f"Reference data update complete. Results: {ref_data_results}")
 
-    # Example usage - run incremental update for last 7 days
-    # Commenting out for now to focus on reference data update, can be re-enabled
-    # incremental_results = collector.run_incremental_update(days_back=7)
-    # with open(Path(config.cache_dir) / f"incremental_run_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json", "w") as f:
-    #     json.dump(incremental_results, f, indent=2)
-    # print(f"Incremental collection complete. Results: {incremental_results}")
+    # Scheduling Information:
+    # This script can be scheduled to run regularly (e.g., every 15 minutes or hourly)
+    # using cron, Windows Task Scheduler, or a workflow orchestrator like Apache Airflow.
+    # Example cron job to run every 15 minutes:
+    # */15 * * * * /usr/bin/python3 /path/to/your_virtualenv/bin/python /path/to/sedar_collector.py >> /path/to/sedar_collector_cron.log 2>&1
+    # Ensure environment variables (SUPABASE_URL, SUPABASE_KEY, etc.) are available to the cron environment
+    # or are loaded within the script (e.g., using a .env file and python-dotenv if not already handled).
+    # Consider the API rate limits and the frequency of new filings when choosing the schedule.
+    # Running too frequently (e.g., every minute) might not be necessary and could strain the API.
+    # Hourly or every 15-30 minutes is likely a reasonable starting point for incremental updates.
+
+    # Update reference data (e.g., list of issuers, document types)
+    # This might not need to run as frequently as the incremental filing check.
+    # Could be daily or even less frequent depending on how often this data changes.
+    logger.info("Starting reference data update...")
+    ref_data_results = collector.update_reference_data()
+    ref_results_path = Path(config.cache_dir) / f"reference_update_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    with open(ref_results_path, "w") as f:
+        json.dump(ref_data_results, f, indent=2, default=str)
+    logger.info(f"Reference data update complete. Results saved to {ref_results_path}")
+    print(f"Reference data update complete. See logs and {ref_results_path} for details.")
+
+    # Example usage - run incremental update for the last 2 days (e.g., today and yesterday)
+    # This uses the new JSON/PDF byte workflow.
+    # Adjust `days_back` based on how reliably the script runs and potential catch-up needs.
+    # If running every 15 mins, `days_back=1` (for today) might be sufficient most of the time,
+    # but `days_back=2` provides a small buffer.
+    logger.info("Starting incremental update for recent filings (e.g., last 2 days)...")
+    incremental_results = collector.run_incremental_update(days_back=2) 
+    
+    incremental_results_path = Path(config.cache_dir) / f"incremental_run_results_json_pdf_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    with open(incremental_results_path, "w") as f:
+        json.dump(incremental_results, f, indent=2, default=str) # Use default=str for datetime if any
+    logger.info(f"Incremental collection complete. Results saved to {incremental_results_path}")
+    print(f"Incremental collection complete. Results: {incremental_results}")
+
 
 if __name__ == "__main__":
     main()
